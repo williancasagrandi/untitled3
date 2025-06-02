@@ -1,0 +1,579 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Banco de dados PostgreSQL
+  postgres:
+    image: postgres:15
+    container_name: chatflow_postgres
+    environment:
+      POSTGRES_DB: chatflow
+      POSTGRES_USER: chatflow
+      POSTGRES_PASSWORD: chatflow_password_2024
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - chatflow_network
+
+  # Redis para cache e filas
+  redis:
+    image: redis:7-alpine
+    container_name: chatflow_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - chatflow_network
+
+  # API Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chatflow_api
+    ports:
+      - "5000:5000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://chatflow:chatflow_password_2024@postgres:5432/chatflow
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: sua_chave_jwt_super_secreta_aqui
+      OPENAI_API_KEY: sua_chave_openai_aqui
+      WEBHOOK_SECRET: webhook_secret_key_2024
+      FRONTEND_URL: http://localhost:3000
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./logs:/app/logs
+      - ./sessions:/app/sessions
+    networks:
+      - chatflow_network
+
+  # Frontend React
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: chatflow_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:5000/api
+      REACT_APP_SOCKET_URL: http://localhost:5000
+    depends_on:
+      - api
+    networks:
+      - chatflow_network
+
+  # Nginx para proxy reverso
+  nginx:
+    image: nginx:alpine
+    container_name: chatflow_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - api
+      - frontend
+    networks:
+      - chatflow_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  chatflow_network:
+    driver: bridge
+
+---
+
+# Dockerfile (Backend)
+FROM node:18-alpine
+
+WORKDIR /app
+  
+  # Instalar dependências do sistema
+RUN apk add --no-cache \
+chromium \
+nss \
+freetype \
+freetype-dev \
+harfbuzz \
+ca-certificates \
+ttf-freefont
+  
+  # Definir variável para Puppeteer usar Chromium instalado
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+  
+  # Copiar arquivos de dependência
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+  
+  # Copiar código fonte
+COPY . .
+  
+  # Gerar cliente Prisma
+RUN npx prisma generate
+  
+  # Criar diretórios necessários
+RUN mkdir -p logs sessions uploads
+  
+  # Expor porta
+EXPOSE 5000
+  
+  # Comando de inicialização
+CMD ["npm", "start"]
+
+---
+
+# frontend/Dockerfile
+FROM node:18-alpine as build
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/build /usr/share/nginx/html
+COPY nginx.frontend.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 3000
+
+CMD ["nginx", "-g", "daemon off;"]
+
+---
+
+# .env.example
+# Configurações do banco de dados
+DATABASE_URL=postgresql://usuario:senha@localhost:5432/chatflow
+  
+  # Configurações do Redis
+REDIS_URL=redis://localhost:6379
+  
+  # Chaves de segurança
+JWT_SECRET=sua_chave_jwt_super_secreta_de_pelo_menos_32_caracteres
+WEBHOOK_SECRET=webhook_secret_key_muito_segura_2024
+  
+  # APIs externas
+OPENAI_API_KEY=sk-sua_chave_openai_aqui
+STRIPE_SECRET_KEY=sk_test_sua_chave_stripe_aqui
+STRIPE_WEBHOOK_SECRET=whsec_sua_chave_webhook_stripe_aqui
+  
+  # URLs
+FRONTEND_URL=http://localhost:3000
+API_URL=http://localhost:5000
+  
+  # Configurações de email (opcional)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=seu_email@gmail.com
+SMTP_PASS=sua_senha_de_app
+  
+  # Ambiente
+NODE_ENV=development
+PORT=5000
+LOG_LEVEL=info
+  
+  # AWS S3 (para uploads)
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=sua_access_key
+AWS_SECRET_ACCESS_KEY=sua_secret_key
+AWS_S3_BUCKET=chatflow-uploads
+  
+  # Configurações de rate limiting
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=100
+
+---
+
+# nginx.conf
+  events {
+  worker_connections 1024;
+}
+
+  http {
+  upstream api {
+  server api:5000;
+  }
+  
+  upstream frontend {
+  server frontend:3000;
+  }
+  
+  # Rate limiting
+  limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+  limit_req_zone $binary_remote_addr zone=login:10m rate=1r/s;
+  
+  server {
+  listen 80;
+  server_name localhost;
+  
+  # Gzip compression
+  gzip on;
+  gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+  
+  # Frontend
+  location / {
+  proxy_pass http://frontend;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  
+  # API
+  location /api/ {
+  limit_req zone=api burst=20 nodelay;
+  
+  proxy_pass http://api;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  
+  # CORS headers
+  add_header Access-Control-Allow-Origin $http_origin;
+  add_header Access-Control-Allow-Credentials true;
+  add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS";
+  add_header Access-Control-Allow-Headers "Authorization, Content-Type, Accept";
+  
+  if ($request_method = OPTIONS) {
+  return 200;
+  }
+  }
+  
+  # Login rate limiting
+  location /api/auth/login {
+  limit_req zone=login burst=5 nodelay;
+  
+  proxy_pass http://api;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  
+  # Socket.IO
+  location /socket.io/ {
+  proxy_pass http://api;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  
+  # Webhooks (sem rate limit)
+  location /api/webhooks/ {
+  proxy_pass http://api;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  
+  # Health check
+  location /health {
+  proxy_pass http://api;
+  access_log off;
+  }
+  }
+}
+
+---
+
+# Scripts package.json
+{
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "build": "echo 'Build completed'",
+    "test": "jest --coverage",
+    "test:watch": "jest --watch",
+    "migrate": "npx prisma migrate deploy",
+    "migrate:dev": "npx prisma migrate dev",
+    "migrate:reset": "npx prisma migrate reset",
+    "seed": "node src/database/seed.js",
+    "generate": "npx prisma generate",
+    "studio": "npx prisma studio",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f",
+    "deploy:staging": "./scripts/deploy-staging.sh",
+    "deploy:production": "./scripts/deploy-production.sh",
+    "backup:db": "./scripts/backup-database.sh",
+    "restore:db": "./scripts/restore-database.sh"
+  }
+}
+
+---
+
+# scripts/deploy-production.sh
+#!/bin/bash
+
+  set -e
+  
+  echo "🚀 Iniciando deploy para produção..."
+  
+  # Verificar se estamos na branch main
+  BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$BRANCH" != "main" ]; then
+  echo "❌ Deploy deve ser feito a partir da branch main"
+  exit 1
+  fi
+  
+  # Verificar se há mudanças não commitadas
+  if [ -n "$(git status --porcelain)" ]; then
+  echo "❌ Há mudanças não commitadas. Commit suas mudanças antes do deploy."
+  exit 1
+  fi
+  
+  # Fazer backup do banco
+  echo "📦 Fazendo backup do banco de dados..."
+  ./scripts/backup-database.sh
+  
+  # Atualizar código
+  echo "📥 Atualizando código..."
+  git pull origin main
+  
+  # Instalar dependências
+  echo "📦 Instalando dependências..."
+  npm ci --only=production
+  
+  # Gerar cliente Prisma
+  echo "🔧 Gerando cliente Prisma..."
+  npx prisma generate
+  
+  # Executar migrações
+  echo "🗃️ Executando migrações do banco..."
+  npx prisma migrate deploy
+  
+  # Build da aplicação
+  echo "🏗️ Fazendo build da aplicação..."
+  npm run build
+  
+  # Reiniciar serviços
+  echo "🔄 Reiniciando serviços..."
+  docker-compose down
+  docker-compose up -d --build
+  
+  # Verificar se os serviços estão rodando
+  echo "🏥 Verificando saúde dos serviços..."
+  sleep 10
+  
+  if curl -f http://localhost:5000/health; then
+  echo "✅ API está respondendo"
+  else
+  echo "❌ API não está respondendo"
+  exit 1
+  fi
+  
+  if curl -f http://localhost:3000; then
+  echo "✅ Frontend está respondendo"
+  else
+  echo "❌ Frontend não está respondendo"
+  exit 1
+  fi
+  
+  echo "🎉 Deploy realizado com sucesso!"
+echo "📊 Logs: docker-compose logs -f"
+
+---
+
+# scripts/backup-database.sh
+#!/bin/bash
+
+  set -e
+  
+  TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+  BACKUP_DIR="./backups"
+  BACKUP_FILE="$BACKUP_DIR/chatflow_backup_$TIMESTAMP.sql"
+  
+  echo "🗃️ Iniciando backup do banco de dados..."
+  
+  # Criar diretório de backup se não existir
+  mkdir -p $BACKUP_DIR
+  
+  # Fazer backup usando pg_dump
+  docker exec chatflow_postgres pg_dump -U chatflow chatflow > $BACKUP_FILE
+  
+  # Comprimir backup
+  gzip $BACKUP_FILE
+
+echo "✅ Backup realizado: $BACKUP_FILE.gz"
+
+# Manter apenas os 30 backups mais recentes
+  cd $BACKUP_DIR
+  ls -t chatflow_backup_*.sql.gz | tail -n +31 | xargs -r rm
+  
+  echo "🧹 Backups antigos removidos"
+
+---
+
+# scripts/restore-database.sh
+#!/bin/bash
+
+  set -e
+  
+  if [ -z "$1" ]; then
+echo "❌ Uso: ./restore-database.sh <arquivo_backup.sql.gz>"
+  exit 1
+  fi
+  
+  BACKUP_FILE=$1
+  
+  if [ ! -f "$BACKUP_FILE" ]; then
+echo "❌ Arquivo de backup não encontrado: $BACKUP_FILE"
+  exit 1
+  fi
+
+echo "⚠️ ATENÇÃO: Este processo irá SOBRESCREVER o banco de dados atual!"
+read -p "Tem certeza que deseja continuar? (yes/no): " confirm
+
+if [ "$confirm" != "yes" ]; then
+                                                       echo "Operação cancelada."
+                                                       exit 0
+  fi
+  
+  echo "🗃️ Restaurando banco de dados..."
+  
+  # Descomprimir se necessário
+  if [[ $BACKUP_FILE == *.gz ]]; then
+  gunzip -c $BACKUP_FILE > temp_restore.sql
+  RESTORE_FILE="temp_restore.sql"
+  else
+  RESTORE_FILE=$BACKUP_FILE
+  fi
+  
+  # Parar aplicação
+  docker-compose stop api
+  
+  # Restaurar banco
+  docker exec -i chatflow_postgres psql -U chatflow -d chatflow < $RESTORE_FILE
+  
+  # Limpar arquivo temporário
+  if [ "$RESTORE_FILE" = "temp_restore.sql" ]; then
+  rm temp_restore.sql
+  fi
+  
+  # Reiniciar aplicação
+  docker-compose start api
+  
+  echo "✅ Banco de dados restaurado com sucesso!"
+
+---
+
+# .github/workflows/ci.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: chatflow_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run database migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chatflow_test
+
+      - name: Run tests
+        run: npm test
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chatflow_test
+          JWT_SECRET: test_secret
+          NODE_ENV: test
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy to production
+        run: |
+          echo "🚀 Deploy to production would run here"
+          # Aqui você adicionaria os comandos reais de deploy
+          # Por exemplo, usando AWS, Digital Ocean, Heroku, etc.
+
+---
+
+# init.sql
+-- Script de inicialização do banco de dados
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Criar usuário para a aplicação se não existir
+DO $$
+BEGIN
+IF NOT EXISTS (SELECT FROM pg_user WHERE usename = 'chatflow') THEN
+CREATE USER chatflow WITH PASSWORD 'chatflow_password_2024';
+END IF;
+END $$;
+
+-- Dar permissões
+GRANT ALL PRIVILEGES ON DATABASE chatflow TO chatflow;
+
+-- Configurações de performance
+ALTER SYSTEM SET shared_preload_libraries = 'pg_stat_statements';
+ALTER SYSTEM SET max_connections = 200;
+ALTER SYSTEM SET shared_buffers = '256MB';
+ALTER SYSTEM SET effective_cache_size = '1GB';
+ALTER SYSTEM SET work_mem = '4MB';
+ALTER SYSTEM SET maintenance_work_mem = '64MB';
+
+SELECT pg_reload_conf();
